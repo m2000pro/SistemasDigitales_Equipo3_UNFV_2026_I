@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "author": "Miguel de Jesús Selva Sánchez",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 134.4, "left": -52.76, "attrs": {} },
+    {
+      "type": "wokwi-membrane-keypad",
+      "id": "keypad1",
+      "top": -126.8,
+      "left": -426.4,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r2",
+      "top": 282.35,
+      "left": 153.6,
+      "attrs": { "value": "220" }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led2",
+      "top": 217.2,
+      "left": 224.6,
+      "attrs": { "color": "green" }
+    },
+    { "type": "board-mfrc522", "id": "rfid1", "top": 314.15, "left": 147.44, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "rfid1:SDA", "esp:5", "green", [ "h-28.8", "v-48" ] ],
+    [ "rfid1:SCK", "esp:18", "green", [ "h-19.2", "v-67.2" ] ],
+    [ "rfid1:MOSI", "esp:23", "green", [ "h-9.6", "v-144" ] ],
+    [ "rfid1:MISO", "esp:19", "green", [ "h-38.4", "v-96" ] ],
+    [ "rfid1:GND", "esp:GND.2", "black", [ "h-57.6", "v-182.4" ] ],
+    [ "rfid1:RST", "esp:22", "green", [ "h-67.2", "v-172.8" ] ],
+    [ "rfid1:3.3V", "esp:3V3", "green", [ "h-259.2", "v-259.2" ] ],
+    [ "keypad1:R1", "esp:13", "green", [ "v0" ] ],
+    [ "keypad1:R2", "esp:14", "green", [ "v0" ] ],
+    [ "keypad1:R3", "esp:27", "green", [ "v0" ] ],
+    [ "keypad1:R4", "esp:26", "green", [ "v38.4", "h230.05" ] ],
+    [ "keypad1:C1", "esp:25", "green", [ "v0" ] ],
+    [ "keypad1:C2", "esp:33", "green", [ "v0" ] ],
+    [ "keypad1:C3", "esp:32", "green", [ "v0" ] ],
+    [ "keypad1:C4", "esp:4", "green", [ "v163.2", "h326.1", "v-96" ] ],
+    [ "esp:2", "r2:1", "green", [ "h0" ] ],
+    [ "r2:2", "led2:A", "green", [ "v0" ] ],
+    [ "led2:C", "esp:GND.1", "black", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}
