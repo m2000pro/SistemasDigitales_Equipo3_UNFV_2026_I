@@ -1,0 +1,1125 @@
+/**
+ * @file main.cpp
+ * @brief Firmware de Control de Acceso 2FA Híbrido (Online/Offline)
+ * @details Implementación de FSM (Máquina de Moore) con fallback atómico a memoria Flash (NVS) 
+ * y cifrado SHA-256 por hardware. Operación no bloqueante y acceso a registros Bare-Metal.
+ */
+
+#include <Arduino.h>
+#include <time.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Keypad.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <mbedtls/md.h> 
+#include <WebServer.h>
+
+// Configuración de red y endpoints excluidos del VCS (.gitignore)
+#include "secrets.h"
+
+// Registros ESP32 para acceso atómico GPIO (Memory-Mapped I/O)
+#include "soc/soc.h"
+#include "soc/gpio_reg.h"
+
+// --- HARDWARE ABSTRACTION LAYER (HAL) ---
+// Mapeo de periféricos físicos a los pines del microcontrolador
+#define LED_VERDE_PIN  4   
+#define LED_ROJO_PIN   2   
+#define WIFI_KILL_PIN  21  
+#define BOTON_SALIDA_PIN  34  
+#define SENSOR_PUERTA_PIN 35  
+#define BUZZER_PIN         15  
+
+#define RFID_RST_PIN   22  
+#define RFID_SS_PIN    5   
+
+#define OLED_SDA       16
+#define OLED_SCL       17
+#define SCREEN_WIDTH   128 
+#define SCREEN_HEIGHT  64  
+
+// --- PARÁMETROS MATRIZ 4x4 (Segmento .data - Inicializado) ---
+const byte FILAS = 4;
+const byte COLUMNAS = 4;
+char teclas[FILAS][COLUMNAS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte pinesFilas[FILAS] = {13, 12, 14, 27}; 
+byte pinesColumnas[COLUMNAS] = {26, 25, 33, 32}; 
+
+// --- INSTANCIACIÓN DE OBJETOS GLOBALES (Heap) ---
+Keypad teclado = Keypad(makeKeymap(teclas), pinesFilas, pinesColumnas, FILAS, COLUMNAS);
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Preferences prefs; // Interfaz para la partición NVS (Memoria Flash No Volátil)
+WebServer server(80);
+
+// --- DEFINICIÓN DE ESTADOS DE LA FSM (Máquina de Moore) ---
+// El comportamiento de las salidas lógicas depende exclusivamente del estado actual.
+enum EstadoSistema { 
+  ESPERANDO_TARJETA, 
+  ESPERANDO_PIN, 
+  VALIDANDO_NUBE, 
+  ACCESO_CONCEDIDO, 
+  CERRADURA_ABIERTA, 
+  ACCESO_DENEGADO,
+  VALIDANDO_LOCAL,         
+  GUARDANDO_LOG_OFFLINE,   
+  SINCRONIZANDO_LOGS,
+  ESPERANDO_CLAVE_MAESTRA,
+  CONFIGURACION_WIFI       
+};
+
+EstadoSistema estadoActual = ESPERANDO_TARJETA;
+
+// --- VARIABLES DE CONTEXTO (SRAM - Segmento .bss) ---
+// Variables globales inicializadas a 0 por defecto. Mantienen el estado del entorno.
+bool redDisponible = false;
+unsigned long timerApertura = 0;
+unsigned long timerPinTimeout = 0;
+unsigned long timerReconexion = 0;
+const unsigned long INTERVALO_RECONEXION = 30000;
+unsigned long timerPuertaAbierta = 0;
+unsigned long timerAdmin = 0;
+unsigned long timerHeartbeat = 0;
+bool puertaEstabaAbierta = false;
+bool modoClase = false;
+bool alarmaPuertaEnviada = false;
+String uidLeido = "";
+String pinIngresado = "";
+String asteriscosEnmascarados = "";
+Preferences prefsWiFi;
+String bufferAdmin = "";
+String idTerminalGlobal = "LAB_COMPUTO"; 
+
+unsigned long timerBuzzer = 0;
+bool estadoBuzzer = false;
+
+// --- VARIABLES DE TELEMETRÍA Y BÚFERES ---
+unsigned long t_inicio_auth = 0;
+int intentosOffline = 0;
+int accesosExitososOffline = 0;
+
+// Reserva de memoria en el Montículo (Heap) para evitar desbordamientos 
+// al deserializar JSONs complejos provenientes de Firebase.
+static StaticJsonDocument<4096> docMemoria;
+
+// --- FORWARD DECLARATIONS (Firmas de funciones) ---
+void conectarWiFiReal();
+int validarCredencialNube(String uid, String pin);
+bool validarCredencialLocal(String uid, String pin);
+void mostrarInterfazOLED(String titulo, String mensaje, String submensaje);
+String generarHashSHA256(String texto);
+void sincronizarLogsOffline();
+void iniciarModoAP();
+void handleRoot();
+void handleSave();
+
+/**
+ * @brief Algoritmo conversor de formatos de tiempo.
+ * Transforma horas visuales a un valor aritmético lineal (minutos absolutos) 
+ * para optimizar la comparación condicional en la ALU del microcontrolador.
+ */
+int convertirHoraStrAMinutos(String horaStr) {
+  horaStr.trim();
+  String horaParte = horaStr;
+  String ampm = "";
+
+  int spaceIdx = horaStr.indexOf(' ');
+  if (spaceIdx != -1) {
+    horaParte = horaStr.substring(0, spaceIdx);
+    ampm = horaStr.substring(spaceIdx + 1);
+    ampm.toUpperCase();
+  }
+
+  int colonIdx = horaParte.indexOf(':');
+  if (colonIdx == -1) return 0;
+
+  int h = horaParte.substring(0, colonIdx).toInt();
+  int m = horaParte.substring(colonIdx + 1).toInt();
+
+  // Parche predictivo de la APP de reservas (Lógica Combinacional de ajuste)
+  if (ampm == "PM" && h != 12) h += 12;
+  else if (ampm == "AM" && h == 12) h = 0;
+  else if (ampm == "" && h > 0 && h < 7) h += 12;
+
+  return h * 60 + m;
+}
+
+/**
+ * @brief Subrutina de telemetría hacia la nube (Firebase).
+ */
+void actualizarEstadoPuertaNube(String estado) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String urlTelemetria = "https://labacces-1b14d-default-rtdb.firebaseio.com/configuracion_laboratorios/" + idTerminalGlobal + ".json";
+    http.begin(urlTelemetria);
+    String payload = "{\"estado_puerta\": \"" + estado + "\"}";
+    http.PATCH(payload);
+    http.end();
+  }
+}
+
+/**
+ * @brief Sistema de registro de auditoría. 
+ * Aplica contingencia volcando datos a la partición Flash (NVS) si no hay red,
+ * garantizando cero pérdida de paquetes mediante colas.
+ */
+void registrarAuditoria(String uid, String evento, String modo) {
+  struct tm timeinfo;
+  String horaExacta = "OFFLINE_TIME";
+  if (getLocalTime(&timeinfo)) {
+    char timeBuff[50];
+    strftime(timeBuff, sizeof(timeBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    horaExacta = String(timeBuff);
+  }
+
+  DynamicJsonDocument logDoc(256); // Alojamiento temporal en el Heap local
+  logDoc["uid"] = uid;
+  logDoc["hora"] = horaExacta;
+  logDoc["evento"] = evento;
+  logDoc["modo"] = modo;
+  logDoc["id_terminal"] = idTerminalGlobal;
+
+  String payloadJSON;
+  serializeJson(logDoc, payloadJSON);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(FIREBASE_URL_AUDITORIA);
+    http.setTimeout(2500);
+    http.addHeader("Content-Type", "application/json");
+    http.POST(payloadJSON);
+    http.end();
+  } else {
+    // Operación I/O con Memoria No Volátil (Sistema de persistencia offline)
+    int totalLogs = prefs.getInt("total_logs", 0);
+    totalLogs++;
+    String claveLog = "log_" + String(totalLogs);
+    prefs.putString(claveLog.c_str(), payloadJSON);
+    prefs.putInt("total_logs", totalLogs);
+    Serial.printf("[LOG OFFLINE] Encolado en NVS (Posición %d)\n", totalLogs);
+  }
+}
+
+/**
+ * @brief Procedimiento de volcado dinámico hacia la caché local.
+ * Filtra de forma lógica qué credenciales corresponden a este terminal 
+ * para optimizar el espacio en la memoria Flash.
+ */
+void sincronizarCredencialesDesdeFirebase() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  Serial.println("[NVS-SYNC] Descargando credenciales y mapeando laboratorios...");
+
+  HTTPClient http;
+  http.setTimeout(4000); 
+
+  int intentos = 0;
+  int httpCode = -1;
+  
+  while (intentos < 3 && httpCode <= 0) {
+    http.begin(FIREBASE_URL_USUARIOS);
+    httpCode = http.GET();
+    if (httpCode <= 0) delay(2000);
+    intentos++;
+  }
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(8192); // Heap buffer expandido para arrays de horarios
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error) {
+      JsonObject usuarios = doc.as<JsonObject>();
+      int agregados = 0;
+      
+      for (JsonPair kv : usuarios) {
+        JsonObject datosUsuario = kv.value().as<JsonObject>();
+        String uidTarjeta = datosUsuario["uid"].as<String>();
+        String hashPin = datosUsuario["pin"].as<String>();
+        bool habilitado = datosUsuario["habilitado"].as<bool>();
+        
+        bool perteneceAEsteLab = false;
+        JsonArray horarios = datosUsuario["horarios"].as<JsonArray>();
+
+        // Inspeccionamos si al menos una franja horaria le corresponde a esta puerta
+        for (JsonObject h : horarios) {
+          String term = h["id_terminal"].as<String>();
+          // Fallback retrospectivo de arquitectura de datos
+          if (term.length() == 0) term = datosUsuario["laboratorio"].as<String>().indexOf("Electrónica") > 0 ? "LAB_ELECTRONICA" : "LAB_COMPUTO";
+          
+          if (term == idTerminalGlobal) {
+            perteneceAEsteLab = true;
+            break; 
+          }
+        }
+
+        if (habilitado && perteneceAEsteLab) {
+          prefs.putString(uidTarjeta.c_str(), hashPin); // Inserción en bloque IROM/NVS
+          agregados++;
+        } else {
+          // Si está inhabilitado o no pertenece al lab, purgar registro de hardware
+          prefs.remove(uidTarjeta.c_str());
+        }
+      }
+      Serial.printf("[NVS-SYNC] Caché NVS actualizada. %d usuarios autorizados localmente.\n", agregados);
+    }
+  } else {
+    Serial.printf("[ERR] Sincronización abortada. HTTP Final: %d\n", httpCode);
+  }
+  http.end();
+}
+
+String obtenerClaveMaestra() {
+  prefsWiFi.begin("wifi_net", true); // Montaje en solo lectura (Read-Only)
+  String clave = prefsWiFi.getString("pin_admin", CLAVE_MAESTRA_ADMIN);
+  prefsWiFi.end();
+  return clave;
+}
+
+/**
+ * @brief Rutina PWM por software para transductor piezoeléctrico.
+ * Bypassea limitaciones del módulo LEDC generando una onda cuadrada manualmente.
+ */
+void generarTono(int duracionMs) {
+  unsigned long inicio = millis();
+  // Genera una onda cuadrada de 2kHz (250us ALTO, 250us BAJO)
+  while (millis() - inicio < duracionMs) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delayMicroseconds(250); 
+    digitalWrite(BUZZER_PIN, LOW);
+    delayMicroseconds(250); 
+  }
+}
+
+void setup() {
+  Serial.begin(115200); // Interfaz UART
+  
+  pinMode(WIFI_KILL_PIN, INPUT_PULLUP);
+  
+  // --- CONFIGURACIÓN TRI-STATE DEL RELÉ (Lógica de Hardware) ---
+  pinMode(LED_ROJO_PIN, OUTPUT);
+  digitalWrite(LED_ROJO_PIN, LOW);
+  
+  // Se establece como INPUT (Alta Impedancia) para evitar activación involuntaria en el bootloader
+  pinMode(LED_VERDE_PIN, OUTPUT);
+  digitalWrite(LED_VERDE_PIN, HIGH); 
+  
+  // Inicialización del bus de comunicaciones I2C (Display)
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    Serial.println(F("[ERR] Error crítico: Init SSD1306 I2C"));
+    while(true); // Trap loop
+  }
+  
+  display.clearDisplay();
+  mostrarInterfazOLED("SISTEMA", "Iniciando", "LAB ACCESS");
+
+  // Inicialización del bus SPI (RFID)
+  SPI.begin(); 
+  rfid.PCD_Init();
+
+  pinMode(BOTON_SALIDA_PIN, INPUT);
+  pinMode(SENSOR_PUERTA_PIN, INPUT);
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Inicialización del sistema de archivos NVS
+  if (!prefs.begin("cache_2fa", false)) {
+    Serial.println("[ERR] Error crítico: Fallo montaje NVS");
+    while (true) { delay(1000); }
+  }
+
+  idTerminalGlobal = prefs.getString("id_terminal", "LAB_COMPUTO");
+  Serial.println("[NVS] ID de Terminal configurado como: " + idTerminalGlobal);
+
+  conectarWiFiReal();
+  configTime(-5 * 3600, 0, "pool.ntp.org", "time.nist.gov"); // Sincronización NTP
+  sincronizarCredencialesDesdeFirebase();
+  
+  mostrarInterfazOLED("SISTEMA LISTO", "Pase su", "TARJETA");
+}
+
+void loop() {
+  // --- CICLO FETCH-DECODE-EXECUTE PRINCIPAL ---
+  
+  // 1. MONITORIZACIÓN Y RECONEXIÓN ASÍNCRONA (Gestión de Interrupciones de Red)
+  if (estadoActual != CONFIGURACION_WIFI && 
+      estadoActual != ESPERANDO_CLAVE_MAESTRA && 
+      estadoActual != ACCESO_CONCEDIDO && 
+      estadoActual != CERRADURA_ABIERTA) {
+    
+    if (WiFi.status() != WL_CONNECTED && redDisponible) {
+      redDisponible = false;
+      Serial.println("\n[WARN] Caída de enlace WiFi. Transicionando a modo híbrido.");
+      mostrarInterfazOLED("ALERTA DE RED", "Modo Offline", "Conexion perdida");
+      delay(1000); 
+    }
+
+    if (!redDisponible) {
+      if (millis() - timerReconexion >= INTERVALO_RECONEXION) {
+        Serial.print("[NET] Intentando restaurar conexión en background... ");
+        WiFi.disconnect(); 
+        WiFi.begin(REAL_WIFI_SSID, REAL_WIFI_PASSWORD); 
+        timerReconexion = millis();
+      }
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[NET] ¡Conexión restaurada con éxito!");
+        redDisponible = true;
+        estadoActual = SINCRONIZANDO_LOGS; 
+      }
+    }
+  }
+
+  // PATRÓN HEARTBEAT (Latido de vida cada 60 seg)
+  if (redDisponible) {
+    if (millis() - timerHeartbeat > 60000) {
+      timerHeartbeat = millis();
+      time_t now;
+      time(&now); 
+      
+      HTTPClient http;
+      String url = "https://labacces-1b14d-default-rtdb.firebaseio.com/configuracion_laboratorios/" + idTerminalGlobal + ".json";
+      http.begin(url);
+      String payload = "{\"ultimo_ping\": " + String(now) + "}";
+      http.PATCH(payload);
+      http.end();
+    }
+  }
+
+  // --- 2. LECTURA BARE-METAL DIRECTA A REGISTROS (Polling ultrarrápido) ---
+  // Acceso directo al mapa de memoria de los periféricos (GPIO_IN1_REG).
+  // Lee los pines 32-39 en un único ciclo de reloj.
+  uint32_t gpio_in1_state = REG_READ(GPIO_IN1_REG);
+  
+  // Enmascaramiento de bits (Bitwise Masking) para aislar los pines deseados
+  bool botonSalidaPresionado = !(gpio_in1_state & (1 << (BOTON_SALIDA_PIN - 32)));
+  bool puertaFisicamenteAbierta = (gpio_in1_state & (1 << (SENSOR_PUERTA_PIN - 32)));
+
+  // --- MANEJO DE PRIORIDADES (Simulación de ISR) ---
+  // El botón de salida REX rompe la jerarquía para garantizar evacuación inmediata.
+  if (botonSalidaPresionado && estadoActual == ESPERANDO_TARJETA) {
+    Serial.println("[REX] Petición de salida detectada. Liberando cerradura...");
+    
+    pinMode(LED_VERDE_PIN, OUTPUT);
+    digitalWrite(LED_VERDE_PIN, LOW); 
+    
+    registrarAuditoria("BOTON_INTERIOR", "ACCESO_CONCEDIDO", "REX_FISICO");
+    
+    timerApertura = millis();
+    estadoActual = CERRADURA_ABIERTA;
+  }
+
+  // --- MÓDULO SENSOR MAGNÉTICO (Máquina de estados paralela simple) ---
+  if (puertaFisicamenteAbierta) {
+    if (!puertaEstabaAbierta) {
+      puertaEstabaAbierta = true;
+      timerPuertaAbierta = millis();
+      actualizarEstadoPuertaNube("ABIERTA");
+      Serial.println("[SENSOR] Puerta física abierta.");
+    }
+    
+    unsigned long tiempoAbierta = millis() - timerPuertaAbierta;
+    
+    // Timer para detección de vulneración física prolongada
+    if (tiempoAbierta > 10000 && !modoClase) {
+      // Actuación Bare-Metal W1TS (Write 1 To Set)
+      REG_WRITE(GPIO_OUT_W1TS_REG, (1 << LED_ROJO_PIN)); 
+
+      if (!alarmaPuertaEnviada) {
+         registrarAuditoria("SISTEMA", "PUERTA_ABANDONADA", "SENSOR_FISICO");
+         alarmaPuertaEnviada = true;
+         Serial.println("[ALERTA] Log de PUERTA_ABANDONADA enviado a Firebase");
+      }
+      
+      if (tiempoAbierta <= 25000) {
+        if (millis() - timerBuzzer > 500) {
+          timerBuzzer = millis();
+          estadoBuzzer = !estadoBuzzer;
+          if (estadoBuzzer) tone(BUZZER_PIN, 2000);
+          else noTone(BUZZER_PIN);
+        }
+      } else {
+        noTone(BUZZER_PIN);
+      }
+    }
+  } else {
+    if (puertaEstabaAbierta) {
+      puertaEstabaAbierta = false;
+      alarmaPuertaEnviada = false;
+      noTone(BUZZER_PIN);
+      // Actuación Bare-Metal W1TC (Write 1 To Clear)
+      REG_WRITE(GPIO_OUT_W1TC_REG, (1 << LED_ROJO_PIN));
+      actualizarEstadoPuertaNube("CERRADA");
+      Serial.println("[SENSOR] Puerta física cerrada.");
+    }
+  }
+
+  // --- 3. NÚCLEO LÓGICO FSM PRINCIPAL ---
+  switch (estadoActual) {   
+    case ESPERANDO_TARJETA: {
+      char teclaIdle = teclado.getKey();
+      if (teclaIdle == '*') {
+        Serial.println("[FSM] Iniciando autenticación administrativa...");
+        
+        // --- INICIO MÓDULO DE HARD RESET REMOTO ---
+        if (WiFi.status() == WL_CONNECTED) {
+          mostrarInterfazOLED("ADMIN", "Buscando", "RESET...");
+          HTTPClient http;
+          String urlReset = "https://labacces-1b14d-default-rtdb.firebaseio.com/configuracion_laboratorios/" + idTerminalGlobal + "/hard_reset.json";
+          
+          http.begin(urlReset);
+          http.setTimeout(2500);
+          int httpCode = http.GET();
+          
+          if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            
+            if (payload == "true") {
+              Serial.println("[ADMIN] Comando de Hard Reset remoto detectado. Ejecutando...");
+              
+              // 1. Restaurar la clave en la memoria NVS local
+              prefsWiFi.begin("wifi_net", false);
+              prefsWiFi.putString("pin_admin", CLAVE_MAESTRA_ADMIN); 
+              prefsWiFi.end();
+              
+              // 2. Apagar la bandera en Firebase
+              http.end(); 
+              String urlBase = "https://labacces-1b14d-default-rtdb.firebaseio.com/configuracion_laboratorios/" + idTerminalGlobal + ".json";
+              http.begin(urlBase);
+              http.PATCH("{\"hard_reset\": false}");
+              
+              mostrarInterfazOLED("ADMIN", "Clave", "RESETEADA");
+              Serial.println("[ADMIN] Clave reseteada a 9999. Reiniciando terminal...");
+              delay(2000);
+              ESP.restart(); // Envío de señal de reinicio al sistema operativo en tiempo real (FreeRTOS)
+            }
+          }
+          http.end();
+        }
+        // --- FIN MÓDULO DE HARD RESET REMOTO ---
+
+        bufferAdmin = "";
+        timerAdmin = millis();
+        mostrarInterfazOLED("ADMIN", "Clave:", "_");
+        estadoActual = ESPERANDO_CLAVE_MAESTRA;
+        break; 
+      }
+
+      // Polling del bus SPI (RFID)
+      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        uidLeido = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+          uidLeido += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+          uidLeido += String(rfid.uid.uidByte[i], HEX);
+        }
+        uidLeido.toUpperCase();
+        rfid.PICC_HaltA(); 
+        
+        generarTono(100);
+        
+        Serial.println("\n[INFO] UID Capturado: " + uidLeido);
+        
+        pinIngresado = "";
+        asteriscosEnmascarados = "";
+        timerPinTimeout = millis();
+        
+        mostrarInterfazOLED("SEGUNDO FACTOR", "Ingrese PIN:", "_");
+        estadoActual = ESPERANDO_PIN;
+      }
+      break;
+    }
+    
+    case ESPERANDO_CLAVE_MAESTRA: {
+      char teclaAdmin = teclado.getKey();
+      
+      // Control de latencia y timeout de seguridad
+      if (millis() - timerAdmin > 10000) {
+        Serial.println("[ADMIN] Timeout de ingreso. Abortando.");
+        mostrarInterfazOLED("LISTO", "Pase su", "TARJETA");
+        estadoActual = ESPERANDO_TARJETA;
+        break;
+      }
+
+      if (teclaAdmin) {
+        timerAdmin = millis(); 
+        
+        if (teclaAdmin == '#') { 
+          if (bufferAdmin == obtenerClaveMaestra()) {
+            Serial.println("[ADMIN] Autenticación exitosa. Levantando Portal Wi-Fi.");
+            iniciarModoAP(); 
+            estadoActual = CONFIGURACION_WIFI;
+            timerApertura = millis(); 
+          } else {
+            Serial.println("[ADMIN] Clave incorrecta. Bloqueando acceso.");
+            mostrarInterfazOLED("ERROR", "Clave Invalida", "Acceso Denegado");
+            registrarAuditoria("SISTEMA", "ACCESO_DENEGADO", "FALLO_ADMIN");
+
+            REG_WRITE(GPIO_OUT_W1TS_REG, (1 << LED_ROJO_PIN));
+            delay(2000); 
+            REG_WRITE(GPIO_OUT_W1TC_REG, (1 << LED_ROJO_PIN));
+            
+            mostrarInterfazOLED("SISTEMA LISTO", "Presente su", "Tarjeta RFID");
+            estadoActual = ESPERANDO_TARJETA;
+          }
+        } else if (teclaAdmin == '*') {
+          mostrarInterfazOLED("SISTEMA LISTO", "Presente su", "Tarjeta RFID");
+          estadoActual = ESPERANDO_TARJETA;
+        } else {
+          if (bufferAdmin.length() < 8) {
+            bufferAdmin += teclaAdmin;
+            String mascara = "";
+            for(int i=0; i<bufferAdmin.length(); i++) mascara += "*";
+            mostrarInterfazOLED("MODO ADMIN", "Clave Maestra:", mascara);
+          }
+        }
+      }
+      break;
+    }
+
+    case CONFIGURACION_WIFI:
+      server.handleClient(); // Atención de peticiones HTTP en servidor embebido
+      if (millis() - timerApertura > 180000) { 
+        Serial.println("[AP] Timeout de configuración. Reiniciando...");
+        ESP.restart();
+      }
+      break;
+
+    case ESPERANDO_PIN: {
+      char tecla = teclado.getKey();
+      
+      if (millis() - timerPinTimeout > 15000) {
+        Serial.println("[WARN] Timeout de entrada UART/Keypad.");
+        registrarAuditoria(uidLeido, "ACCESO_DENEGADO", "TIMEOUT_PIN");
+        estadoActual = ACCESO_DENEGADO;
+        break;
+      }
+
+      if (tecla) {
+        timerPinTimeout = millis(); 
+        
+        if (tecla == '#') { 
+          if (pinIngresado.length() > 0) {
+            mostrarInterfazOLED("PROCESANDO", "Verificando...", "Identidad");
+            redDisponible = (WiFi.status() == WL_CONNECTED);
+            estadoActual = redDisponible ? VALIDANDO_NUBE : VALIDANDO_LOCAL;
+          }
+        } else if (tecla == '*') { 
+          pinIngresado = "";
+          asteriscosEnmascarados = "";
+          mostrarInterfazOLED("SEGUNDO FACTOR", "Ingrese PIN:", "_");
+        } else {
+          if (pinIngresado.length() < 4) {
+            pinIngresado += tecla;
+            asteriscosEnmascarados += "*";
+            mostrarInterfazOLED("SEGUNDO FACTOR", "Ingrese PIN:", asteriscosEnmascarados);
+          }
+        }
+      }
+
+      if (pinIngresado.length() == 4) {
+        mostrarInterfazOLED("ESPERE", "Validando", "DATOS...");
+        delay(150); 
+        t_inicio_auth = millis();
+        // Bifurcación asíncrona dependiente del hardware de red
+        redDisponible = (WiFi.status() == WL_CONNECTED);
+        estadoActual = redDisponible ? VALIDANDO_NUBE : VALIDANDO_LOCAL;
+      }
+      break;
+    }
+
+    case VALIDANDO_NUBE: {
+      int estadoAuth = validarCredencialNube(uidLeido, pinIngresado);
+      
+      if (estadoAuth == 1) {
+        registrarAuditoria(uidLeido, "ACCESO_CONCEDIDO", "ONLINE_FIREBASE");
+        estadoActual = ACCESO_CONCEDIDO;
+      } else if (estadoAuth == 0) {
+        registrarAuditoria(uidLeido, "ACCESO_DENEGADO", "ONLINE_FIREBASE");
+        estadoActual = ACCESO_DENEGADO;
+      } else {
+        // estadoAuth == -1 (Red detectada pero sin salida a Internet, transición al modo caché)
+        Serial.println("[WARN] Servidor inalcanzable. Conmutando a caché NVS...");
+        redDisponible = false; 
+        estadoActual = VALIDANDO_LOCAL; 
+      }
+      break;
+    };
+
+    case VALIDANDO_LOCAL: {
+      intentosOffline++;
+      if (validarCredencialLocal(uidLeido, pinIngresado)) {
+        accesosExitososOffline++;
+        float tasaFallo = ((float)accesosExitososOffline / intentosOffline) * 100.0;
+        Serial.printf("[MÉTRICA] Tasa de Tolerancia a Fallos: %.2f%%\n", tasaFallo);
+        estadoActual = GUARDANDO_LOG_OFFLINE;
+      } else {
+        registrarAuditoria(uidLeido, "ACCESO_DENEGADO", "OFFLINE_CACHE");
+        estadoActual = ACCESO_DENEGADO;
+      }
+      break;
+    }
+    
+    case GUARDANDO_LOG_OFFLINE: 
+      registrarAuditoria(uidLeido, "ACCESO_CONCEDIDO", "OFFLINE_CACHE");
+      estadoActual = ACCESO_CONCEDIDO;
+      break;
+
+    case ACCESO_CONCEDIDO:{
+      unsigned long latencia = millis() - t_inicio_auth;
+      String modoAuth = redDisponible ? "ONLINE (Firebase)" : "OFFLINE (Flash NVS)";
+      Serial.printf("[MÉTRICA] Latencia de Autenticación: %lu ms | Modo: %s\n", latencia, modoAuth.c_str());
+      
+      Serial.println("[INFO] 2FA OK. Modificando estado del actuador.");
+      mostrarInterfazOLED("ACCESO OK", "Bienvenido", "ABIERTO");
+      
+      generarTono(100);
+      delay(100);
+      generarTono(100);
+
+      // --- TRANSICIÓN MECÁNICA BARE-METAL ---
+      // Actuación en registros del procesador (1 ciclo de instrucción)
+      digitalWrite(LED_VERDE_PIN, LOW); 
+      REG_WRITE(GPIO_OUT_W1TC_REG, (1 << LED_ROJO_PIN));
+      REG_WRITE(GPIO_OUT_W1TC_REG, (1 << LED_ROJO_PIN));
+      
+      timerApertura = millis();
+      estadoActual = CERRADURA_ABIERTA;
+      break;
+    }
+
+    case CERRADURA_ABIERTA:
+      if (millis() - timerApertura > 5000) { 
+        digitalWrite(LED_VERDE_PIN, HIGH);
+        
+        estadoActual = ESPERANDO_TARJETA;
+        Serial.println("[FSM] Cerradura asegurada.");
+        mostrarInterfazOLED("LISTO", "Pase su", "TARJETA");
+      }
+      break;
+
+    case ACCESO_DENEGADO:
+      Serial.println("[INFO] Autorización denegada.");
+      mostrarInterfazOLED("DENEGADO", "UID/CLAVE", "INVALIDA");
+      
+      REG_WRITE(GPIO_OUT_W1TS_REG, (1 << LED_ROJO_PIN));
+      digitalWrite(LED_VERDE_PIN, HIGH);
+      
+      generarTono(400);
+      delay(150);
+      generarTono(400);
+      
+      delay(2000); // Tiempo de castigo para evitar fuerza bruta de hardware
+      
+      REG_WRITE(GPIO_OUT_W1TC_REG, (1 << LED_ROJO_PIN)); 
+      mostrarInterfazOLED("LISTO", "Pase su", "TARJETA");
+      estadoActual = ESPERANDO_TARJETA;
+      break;
+      
+    case SINCRONIZANDO_LOGS:
+      sincronizarLogsOffline();
+      mostrarInterfazOLED("LISTO", "Pase su", "TARJETA");
+      estadoActual = ESPERANDO_TARJETA;
+      break;
+  }
+}
+
+// --- DRIVER DE PANTALLA OLED (Capa de Presentación) ---
+void mostrarInterfazOLED(String titulo, String mensaje, String submensaje) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(titulo);
+  display.drawFastHLine(0, 10, SCREEN_WIDTH, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 24);
+  display.println(mensaje);
+  
+  if (submensaje.length() <= 10) {
+    display.setTextSize(2);
+    display.setCursor(0, 42); 
+  } else {
+    display.setTextSize(1);
+    display.setCursor(0, 44); 
+  }
+  display.display(); 
+}
+
+// --- SUBSISTEMA DE RED Y PROTOCOLOS ---
+void conectarWiFiReal() {
+  prefsWiFi.begin("wifi_net", true); 
+  String savedSSID = prefsWiFi.getString("ssid", "");
+  String savedPass = prefsWiFi.getString("pass", "");
+  prefsWiFi.end();
+
+  String targetSSID = (savedSSID != "") ? savedSSID : String(REAL_WIFI_SSID);
+  String targetPass = (savedPass != "") ? savedPass : String(REAL_WIFI_PASSWORD);
+
+  WiFi.mode(WIFI_STA); // Configuración del coprocesador de red a modo Estación    
+  WiFi.disconnect(true);     
+  delay(100);                
+
+  Serial.printf("[NET] Inicializando STA SSID: %s \n", targetSSID.c_str());
+  WiFi.begin(targetSSID.c_str(), targetPass.c_str());
+  
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 15) {
+    delay(400);
+    Serial.print(".");
+    intentos++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[NET] Link UP. IP: " + WiFi.localIP().toString());
+    redDisponible = true;
+  } else {
+    Serial.println("\n[NET] Link DOWN. Timeout. Iniciando fallback.");
+    redDisponible = false;
+  }
+}
+
+/**
+ * @brief Interfaz web servida directamente desde la memoria ROM del ESP32.
+ */
+void handleRoot() {
+  String html = "<html><body style='font-family:sans-serif; text-align:center; margin-top:30px; background-color:#0B1320; color:white;'>";
+  html += "<h2>Panel de Administracion LabAccess</h2>";
+  html += "<form action='/save' method='POST' style='background-color:#121B2A; padding:20px; border-radius:10px; display:inline-block;'>";
+  html += "<h3 style='color:#0BB885;'>1. Conexion Wi-Fi</h3>";
+  html += "<input type='text' name='ssid' placeholder='Nombre de la Red (SSID)' required style='padding:8px; width:200px;'><br><br>";
+  html += "<input type='password' name='pass' placeholder='Contrasena Wi-Fi' style='padding:8px; width:200px;'><br><br>";
+  
+  html += "<h3 style='color:#0BB885;'>2. Seguridad del Teclado</h3>";
+  html += "<input type='text' name='new_admin_pin' placeholder='Nueva Clave Maestra (Opcional)' style='padding:8px; width:200px;'><br><br>";
+  
+  html += "<h3 style='color:#0BB885;'>3. Asignar Codigo de Laboratorio</h3>";
+  html += "<p style='color:#888; font-size:12px; margin-top:-10px; margin-bottom:10px;'>Nomenclatura oficial (Ej: LAB-01, FIS-204)</p>";
+  html += "<input type='text' name='id_terminal' value='" + idTerminalGlobal + "' placeholder='Ej: LAB-01' required style='padding:8px; width:200px; border-radius:5px; text-transform:uppercase;'><br><br>";
+  
+  html += "<input type='submit' value='Guardar y Reiniciar' style='background:#0BB885; color:#0B1320; padding:10px 20px; border:none; border-radius:5px; font-weight:bold; cursor:pointer;'>";
+  
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSave() {
+  if (server.hasArg("ssid")) {
+    String newSSID = server.arg("ssid");
+    String newPass = server.arg("pass"); 
+    String newAdminPin = server.arg("new_admin_pin");
+
+    prefsWiFi.begin("wifi_net", false); // Montaje en modo Escritura/Lectura
+    prefsWiFi.putString("ssid", newSSID);
+    prefsWiFi.putString("pass", newPass);
+    
+    if (newAdminPin != "") {
+      prefsWiFi.putString("pin_admin", newAdminPin);
+      Serial.println("[AP] Nueva Clave Maestra registrada en NVS.");
+    }
+
+    if (server.hasArg("id_terminal")) {
+      String nuevoTerminal = server.arg("id_terminal");
+      prefs.putString("id_terminal", nuevoTerminal);
+      idTerminalGlobal = nuevoTerminal;
+      Serial.println("[CONFIG] Nuevo Terminal Asignado: " + idTerminalGlobal);
+    }
+    
+    prefsWiFi.end();
+
+    String htmlExito = "<html><body style='background-color:#0B1320; color:#0BB885; text-align:center; margin-top:50px;'>";
+    htmlExito += "<h2>Configuracion guardada exitosamente.</h2><p>El terminal se esta reiniciando...</p></body></html>";
+    server.send(200, "text/html", htmlExito);
+    
+    delay(1500);
+    ESP.restart(); 
+  }
+}
+
+void iniciarModoAP() {
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+
+  WiFi.mode(WIFI_AP); // Transición de Coprocesador a Access Point
+  delay(100);
+  
+  WiFi.softAP("LabAccess_Config", "admin123",6, 0, 4); 
+  
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin(); 
+  
+  Serial.println("[AP] Portal iniciado limpiamente. Conéctate a 'LabAccess_Config'. IP: 192.168.4.1");
+  mostrarInterfazOLED("MODO CONFIG", "Red: LabAccess_Config", "IP: 192.168.4.1");
+}
+
+// --- SUBSISTEMA CRIPTOGRÁFICO Y PERSISTENCIA (NVS) ---
+/**
+ * @brief Implementación de cifrado SHA-256 utilizando aceleración por hardware.
+ * Invoca directamente la librería nativa de encriptación de mbedTLS del ESP32.
+ */
+String generarHashSHA256(String texto) {
+  byte shaResult[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 0);
+  mbedtls_md_starts(&ctx);
+  mbedtls_md_update(&ctx, (const unsigned char *) texto.c_str(), texto.length());
+  mbedtls_md_finish(&ctx, shaResult);
+  mbedtls_md_free(&ctx);
+
+  String hashHex = "";
+  for (int i = 0; i < 32; i++) {
+    char str[3];
+    sprintf(str, "%02x", (int)shaResult[i]);
+    hashHex += str;
+  }
+  return hashHex;
+}
+
+bool validarCredencialLocal(String uid, String pin) {
+  String hashGuardado = prefs.getString(uid.c_str(), "");
+  if (hashGuardado != "") {
+    String pinHashLocal = generarHashSHA256(pin); // Validación unidireccional matemática
+    if (pinHashLocal == hashGuardado) return true;
+  }
+  return false;
+}
+
+void sincronizarLogsOffline() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  int totalLogs = prefs.getInt("total_logs", 0);
+  if (totalLogs == 0) return;
+
+  Serial.printf("[NVS-LOGS] Iniciando volcado de %d logs offline...\n", totalLogs);
+  mostrarInterfazOLED("CONEXION OK", "Sincronizando", "Logs Offline...");
+
+  HTTPClient http;
+  int logsProcesados = 0; 
+
+  // Procesa la cola de eventos en bloque estructurado (Batch processing)
+  for (int i = 1; i <= totalLogs; i++) {
+    String claveLog = "log_" + String(i);
+    String jsonStringNVS = prefs.getString(claveLog.c_str(), "");
+
+    if (jsonStringNVS != "") {
+      DynamicJsonDocument tempDoc(384);
+      DeserializationError error = deserializeJson(tempDoc, jsonStringNVS);
+
+      if (!error) {
+        String payloadLimpio;
+        serializeJson(tempDoc, payloadLimpio);
+
+        http.begin(FIREBASE_URL_AUDITORIA);
+        http.addHeader("Content-Type", "application/json");
+        int httpCode = http.POST(payloadLimpio);
+        http.end();
+        
+        if (httpCode == 200 || httpCode == 201) {
+          prefs.remove(claveLog.c_str());
+          logsProcesados++;
+        } else {
+          Serial.printf("[NVS-LOGS] Error HTTP %d al subir %s. Pausando volcado.\n", httpCode, claveLog.c_str());
+          break; 
+        }
+      } else {
+        Serial.printf("[NVS-LOGS] Log %s corrompido. Purgando.\n", claveLog.c_str());
+        prefs.remove(claveLog.c_str());
+        logsProcesados++; 
+      }
+    } else {
+      logsProcesados++; 
+    }
+  }
+
+  // Reajuste del puntero de cola en memoria NVS tras el vaciado
+  if (logsProcesados == totalLogs) {
+    prefs.putInt("total_logs", 0);
+    Serial.println("[NVS-LOGS] Volcado 100% completado. Cola NVS vaciada.");
+    mostrarInterfazOLED("SINC EXITOSA", "Logs subidos:", String(logsProcesados));
+  } else if (logsProcesados > 0) {
+    int pendientes = totalLogs - logsProcesados;
+    Serial.printf("[NVS-LOGS] Desplazando cola. Moviendo %d logs pendientes al inicio...\n", pendientes);
+    
+    for (int i = 1; i <= pendientes; i++) {
+      String claveVieja = "log_" + String(i + logsProcesados);
+      String claveNueva = "log_" + String(i);
+      String dato = prefs.getString(claveVieja.c_str(), "");
+      
+      if (dato != "") {
+        prefs.putString(claveNueva.c_str(), dato);
+        prefs.remove(claveVieja.c_str());
+      }
+    }
+    prefs.putInt("total_logs", pendientes);
+    Serial.printf("[NVS-LOGS] Cola reajustada. Quedan %d logs.\n", pendientes);
+  }
+
+  delay(1500); 
+}
+
+/**
+ * @brief Validación lógica extraordinaria 
+ * Verifica si el usuario posee un acceso autorizado por un agente superior en la plataforma.
+ */
+bool tieneReservaAprobada(String nombreEstudiante, struct tm timeinfo, int currentMin) {
+  HTTPClient http;
+  
+  String nombreEncoded = nombreEstudiante;
+  nombreEncoded.replace(" ", "%20");
+  
+  String url = String(FIREBASE_URL_RESERVAS) + "?orderBy=\"estudiante\"&equalTo=\"" + nombreEncoded + "\"";
+  
+  http.begin(url);
+  http.setTimeout(2500); 
+  int httpCode = http.GET();
+  bool reservaActiva = false;
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    
+    if (payload != "null" && payload != "{}") {
+      DynamicJsonDocument docRes(4096);
+      DeserializationError err = deserializeJson(docRes, payload);
+      
+      if (!err) {
+        JsonObject reservas = docRes.as<JsonObject>();
+        String fechaHoy = String(timeinfo.tm_mday) + "/" + String(timeinfo.tm_mon + 1) + "/" + String(timeinfo.tm_year + 1900);
+
+        for (JsonPair kv : reservas) {
+          JsonObject res = kv.value().as<JsonObject>();
+          String estado = res["estado"].as<String>();
+          String lab = res["laboratorio"].as<String>();
+          String fecha = res["fecha"].as<String>();
+
+          bool labMatch = false;
+          if (idTerminalGlobal == "LAB_COMPUTO" && lab.indexOf("Cómputo") >= 0) labMatch = true;
+          else if (idTerminalGlobal == "LAB_ELECTRONICA" && lab.indexOf("Electrónica") >= 0) labMatch = true;
+          else if (idTerminalGlobal == "LAB_QUIMICA" && lab.indexOf("Química") >= 0) labMatch = true;
+
+          // Triple validación para prevenir brechas lógicas
+          if (estado == "aprobado" && labMatch && fecha == fechaHoy) {
+            int inicioRes = convertirHoraStrAMinutos(res["horaInicio"].as<String>());
+            int finRes = convertirHoraStrAMinutos(res["horaFin"].as<String>());
+            
+            if (currentMin >= inicioRes && currentMin <= finRes) {
+              reservaActiva = true;
+              break; 
+            }
+          }
+        }
+      }
+    }
+  }
+  http.end();
+  return reservaActiva;
+}
+
+/**
+ * @brief Subrutina de validación principal en línea (API REST a Firebase).
+ */
+int validarCredencialNube(String uid, String pin) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  HTTPClient http;
+  
+  String url = String(FIREBASE_URL_USUARIOS) + "?orderBy=\"uid\"&equalTo=\"" + uid + "\"";
+  
+  http.begin(url);
+  http.setTimeout(2500); 
+  int httpCode = http.GET();
+  int resultado = 0; 
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    
+    if (payload != "null") {
+      docMemoria.clear(); 
+      DeserializationError error = deserializeJson(docMemoria, payload);
+      
+      if (!error) {
+        JsonObject root = docMemoria.as<JsonObject>();
+        String pinHashLocal = generarHashSHA256(pin);
+
+        for (JsonPair kv : root) {
+          JsonObject usuario = kv.value().as<JsonObject>();
+          String pinHashDB = usuario["pin"].as<String>();
+          bool habilitado = usuario["habilitado"].as<bool>(); 
+          JsonArray horarios = usuario["horarios"].as<JsonArray>();
+
+          // Primer cerrojo: Coincidencia de credenciales y estado global
+          if (pinHashLocal == pinHashDB && habilitado) {
+            
+            struct tm timeinfo;
+            if (!getLocalTime(&timeinfo)) {
+               // Contingencia: Si falla reloj NTP, permite acceso si corresponde al lab.
+               bool perteneceAlLab = false;
+               for (JsonObject h : horarios) {
+                 if (h["id_terminal"].as<String>() == idTerminalGlobal) { perteneceAlLab = true; break; }
+               }
+               resultado = perteneceAlLab ? 1 : 0;
+               break; 
+            }
+
+            int currentMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+            const char* diasSemana[] = {"Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"};
+            String diaActualStr = diasSemana[timeinfo.tm_wday];
+
+            bool horarioValido = false;
+
+            for (JsonObject h : horarios) {
+              String term = h["id_terminal"].as<String>();
+              
+              if (term == idTerminalGlobal && h["dia"].as<String>() == diaActualStr) {
+                int inicioMin = convertirHoraStrAMinutos(h["inicio"].as<String>());
+                int finMin = convertirHoraStrAMinutos(h["fin"].as<String>());
+                
+                if (currentMin >= inicioMin && currentMin <= finMin) {
+                  horarioValido = true;
+                  break; 
+                }
+              }
+            }
+
+            if (horarioValido) {
+              resultado = 1; // Autorizado
+            } else {
+              String nombreUser = usuario["nombre"].as<String>();
+              
+              if (tieneReservaAprobada(nombreUser, timeinfo, currentMin)) {
+                 resultado = 1; 
+                 Serial.println("[ONLINE] Acceso concedido por RESERVA EXTRAORDINARIA");
+              } else {
+                 resultado = 0; // Denegado
+              }
+            }
+            break; 
+          }
+        }
+      }
+    }
+  } else if (httpCode <= 0) {
+    Serial.printf("[ERR] Fallo handshake HTTPS. HTTP Code: %d\n", httpCode);
+    resultado = -1; 
+  }
+  
+  http.end(); 
+  return resultado;
+}
